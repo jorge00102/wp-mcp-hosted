@@ -1,0 +1,17 @@
+services:
+- type: web
+name: wp-mcp
+env: python
+plan: free
+buildCommand: pip install -r requirements.txt
+startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+healthCheckPath: /healthz
+envVars:
+- key: WP_BASE_URL
+sync: false
+- key: WP_USER
+sync: false
+- key: WP_APP_PASSWORD
+sync: false
+- key: MCP_TOKEN
+sync: false
