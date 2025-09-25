@@ -551,44 +551,33 @@ def mcp_schema(authorization: str | None = Header(default=None)):
 async def mcp_sse(request: Request, authorization: str | None = Header(default=None)):
     assert_auth(authorization)
 
-    q: "queue.Queue[str]" = queue.Queue()
+    q: "queue.Queue[tuple[str, str]]" = queue.Queue()
 
     def producer():
-        # Anuncio inicial de herramientas
-        init = {
-            "event": "tools",
-            "data": {
-                "tools": [
-                    {"name": name, "description": t["description"], "schema": t["schema"]}
-                    for name, t in TOOLS.items()
-                ]
-            }
+        # Evento inicial: TOOLS (es lo primero que espera el conector)
+        tools_payload = {
+            "tools": [
+                {"name": name, "description": t["description"], "schema": t["schema"]}
+                for name, t in TOOLS.items()
+            ]
         }
-        q.put(json.dumps(init))
-        # Keepalive
+        q.put(("tools", json.dumps(tools_payload)))
+        # Keep-alive
         while True:
             time.sleep(15)
-            q.put(json.dumps({"event": "ping", "data": {"ts": time.time()}}))
+            q.put(("ping", json.dumps({"ts": time.time()})))
 
     threading.Thread(target=producer, daemon=True).start()
 
     async def event_generator():
-        headers_set = False
         while True:
             if await request.is_disconnected():
                 break
             try:
-                payload = q.get(timeout=30)
-                # sse-starlette gestionará 'text/event-stream'
-                yield {
-                    "event": "message",
-                    "data": payload,
-                }
+                ev, data = q.get(timeout=30)
+                yield {"event": ev, "data": data}
             except queue.Empty:
-                yield {
-                    "event": "message",
-                    "data": json.dumps({"event": "ping", "data": {"ts": time.time()}})
-                }
+                yield {"event": "ping", "data": json.dumps({"ts": time.time()})}
 
     return EventSourceResponse(
         event_generator(),
