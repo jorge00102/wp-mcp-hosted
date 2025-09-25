@@ -1,7 +1,7 @@
 import os, json, time, threading, queue, re, io
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
 from sse_starlette.sse import EventSourceResponse
 import requests
 
@@ -27,7 +27,7 @@ def _norm_auth_header(value: Optional[str]) -> Optional[str]:
     return re.sub(r"\s+", " ", value).strip()
 
 def assert_auth(auth: Optional[str]):
-    # Si MCP_TOKEN está vacío, el servidor NO exige autenticación
+    # Si MCP_TOKEN está vacío, NO exigimos autenticación
     if not MCP_TOKEN:
         return
     if not auth:
@@ -68,11 +68,9 @@ def wp_request(method: str, path: str, json_body: Dict[str, Any] | None = None,
 # ---------------------
 # Implementaciones de TOOLS
 # ---------------------
-# 0) Tools genéricas (varios clientes las esperan)
+# 0) Tools genéricas
 def tool_search(params: Dict[str, Any]):
-    """
-    Buscar en WordPress (páginas y posts) usando /wp/v2/search.
-    """
+    """Busca en WordPress (páginas y posts) usando /wp/v2/search."""
     _ensure_wp_env()
     query = (params.get("query") or "").strip()
     top_k = int(params.get("top_k", 5))
@@ -96,9 +94,7 @@ def tool_search(params: Dict[str, Any]):
     return {"results": results}
 
 def tool_fetch(params: Dict[str, Any]):
-    """
-    Descarga una URL (GET). Devuelve tipo de contenido y texto si aplica.
-    """
+    """Descarga una URL (GET). Devuelve tipo de contenido y texto si aplica."""
     url = (params.get("url") or "").strip()
     if not url or not re.match(r"^https?://", url, re.I):
         raise HTTPException(status_code=400, detail="URL inválida (se requiere http/https)")
@@ -461,6 +457,8 @@ def root():
     return {"ok": True, "service": "wp-mcp", "endpoints": ["/mcp", "/mcp/call", "/healthz"]}
 
 @app.get("/favicon.ico", status_code=204)
+@app.get("/favicon.png", status_code=204)
+@app.get("/favicon.svg", status_code=204)
 def favicon():
     return PlainTextResponse("")
 
@@ -482,7 +480,10 @@ def mcp_schema(authorization: str | None = Header(default=None)):
     return {
         "type": "mcp",
         "transport": "sse",
-        "tools": {name: {"description": t["description"], "schema": t["schema"]} for name, t in TOOLS.items()}
+        "tools": {
+            name: {"description": t["description"], "schema": t["schema"]}
+            for name, t in TOOLS.items()
+        }
     }
 
 # ---------------------
@@ -496,7 +497,13 @@ def mcp_probe(authorization: str | None = Header(default=None)):
         "type": "mcp",
         "transport": "sse",
         "tools": [
-            {"name": name, "description": t["description"], "schema": t["schema"]}
+            {
+                "name": name,
+                "description": t["description"],
+                "schema": t["schema"],         # compat
+                "input_schema": t["schema"],   # requerido por ChatGPT
+                "inputSchema": t["schema"]     # alias camelCase
+            }
             for name, t in TOOLS.items()
         ]
     }
@@ -509,12 +516,18 @@ def mcp_probe(authorization: str | None = Header(default=None)):
 async def mcp_sse(request: Request, authorization: str | None = Header(default=None)):
     assert_auth(authorization)
 
-    q: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+    q = queue.Queue()
 
     def producer():
         initial = {
             "tools": [
-                {"name": name, "description": t["description"], "schema": t["schema"]}
+                {
+                    "name": name,
+                    "description": t["description"],
+                    "schema": t["schema"],         # compat
+                    "input_schema": t["schema"],   # requerido
+                    "inputSchema": t["schema"]     # alias camelCase
+                }
                 for name, t in TOOLS.items()
             ]
         }
