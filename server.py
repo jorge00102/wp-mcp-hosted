@@ -526,6 +526,20 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 @app.get("/healthz/", response_class=PlainTextResponse)
 def healthz():
     return "ok"
+@app.post("/mcp")
+@app.post("/mcp/")
+def mcp_probe(authorization: str | None = Header(default=None)):
+    # si tienes MCP_TOKEN vacío, este assert no bloquea
+    assert_auth(authorization)
+    # respuesta de “sondeo” con el catálogo de tools
+    return {
+        "type": "mcp",
+        "transport": "sse",
+        "tools": [
+            {"name": name, "description": t["description"], "schema": t["schema"]}
+            for name, t in TOOLS.items()
+        ]
+    }
 
 # ---------------------
 # Endpoint de Schema (debug opcional)
