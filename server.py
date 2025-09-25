@@ -1,14 +1,3 @@
-# Archivos del repositorio (estructura y contenido)
-
-> **Nombre sugerido del repo**: `wp-mcp-hosted`
->
-> Incluye todos estos archivos tal cual. Están preparados para: **Render (Python Web Service / Blueprint)** y **ChatGPT Agent mode (Hosted MCP)**. Se añadieron defensas contra *slash* final y posibles `\n` en headers/URL.
-
----
-
-## `server.py`
-
-```python
 import os, json, time, threading, queue, re, io
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, Header, HTTPException
