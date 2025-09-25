@@ -27,8 +27,9 @@ def _norm_auth_header(value: Optional[str]) -> Optional[str]:
     return re.sub(r"\s+", " ", value).strip()
 
 def assert_auth(auth: Optional[str]):
+    # Si MCP_TOKEN está vacío, el servidor NO exige autenticación
     if not MCP_TOKEN:
-        return  # sin autenticación si no hay token configurado
+        return
     if not auth:
         raise HTTPException(status_code=401, detail="Unauthorized: missing Authorization header")
     auth = _norm_auth_header(auth)
@@ -48,11 +49,15 @@ def _ensure_wp_env():
 def wp_request(method: str, path: str, json_body: Dict[str, Any] | None = None,
                files=None, params: Dict[str, Any] | None = None):
     _ensure_wp_env()
+    if not path.startswith("/"):
+        path = "/" + path
     url = f"{WP_BASE_URL}/wp-json/wp/v2{path}"
-    resp = requests.request(
-        method, url, auth=(WP_USER, WP_APP_PASS),
-        json=json_body, files=files, params=params, timeout=45
-    )
+    if files is not None:
+        resp = requests.request(method, url, auth=(WP_USER, WP_APP_PASS),
+                                files=files, params=params, timeout=45)
+    else:
+        resp = requests.request(method, url, auth=(WP_USER, WP_APP_PASS),
+                                json=json_body, params=params, timeout=45)
     if not resp.ok:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     ct = (resp.headers.get("Content-Type") or "")
@@ -63,39 +68,36 @@ def wp_request(method: str, path: str, json_body: Dict[str, Any] | None = None,
 # ---------------------
 # Implementaciones de TOOLS
 # ---------------------
-# 0) Tools genéricas requeridas por varios clientes (search/fetch)
+# 0) Tools genéricas (varios clientes las esperan)
 def tool_search(params: Dict[str, Any]):
     """
-    Busca en WordPress (páginas y posts) usando /wp/v2/search.
+    Buscar en WordPress (páginas y posts) usando /wp/v2/search.
     """
     _ensure_wp_env()
     query = (params.get("query") or "").strip()
     top_k = int(params.get("top_k", 5))
     if not query:
         raise HTTPException(status_code=400, detail="Falta 'query'")
-    # WP search: https://developer.wordpress.org/rest-api/reference/search/
     url = f"{WP_BASE_URL}/wp-json/wp/v2/search"
-    r = requests.get(url, params={"search": query, "per_page": max(1, min(top_k, 20))}, timeout=30,
-                     auth=(WP_USER, WP_APP_PASS))
+    r = requests.get(url, params={"search": query, "per_page": max(1, min(top_k, 20))},
+                     timeout=30, auth=(WP_USER, WP_APP_PASS))
     if not r.ok:
         raise HTTPException(status_code=r.status_code, detail=r.text)
     items = r.json()
-    # Normalizamos campos comunes
     results = []
     for it in items:
         results.append({
             "id": it.get("id"),
             "title": (it.get("title") or ""),
             "url": it.get("url"),
-            "type": it.get("type"),  # post, page, etc.
+            "type": it.get("type"),
             "subtype": it.get("subtype"),
         })
     return {"results": results}
 
 def tool_fetch(params: Dict[str, Any]):
     """
-    Descarga una URL (GET). Uso general que varios clientes esperan.
-    Limita a http/https y tamaño ~1MB.
+    Descarga una URL (GET). Devuelve tipo de contenido y texto si aplica.
     """
     url = (params.get("url") or "").strip()
     if not url or not re.match(r"^https?://", url, re.I):
@@ -105,17 +107,11 @@ def tool_fetch(params: Dict[str, Any]):
         raise HTTPException(status_code=r.status_code, detail=f"Fetch falló: {r.status_code}")
     content_type = r.headers.get("Content-Type", "")
     content = r.content if len(r.content) <= 1_000_000 else r.content[:1_000_000]
-    # Devolvemos texto si posible
     try:
         text = r.text if "text/" in content_type or "json" in content_type else None
     except Exception:
         text = None
-    return {
-        "status": r.status_code,
-        "content_type": content_type,
-        "text": text,
-        "bytes_len": len(content),
-    }
+    return {"status": r.status_code, "content_type": content_type, "text": text, "bytes_len": len(content)}
 
 # 1) Páginas
 def tool_wp_create_page(params: Dict[str, Any]):
@@ -448,7 +444,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "handler": tool_wp_list_tags
     },
 
-    # Usuario
+    # Usuario actual
     "wp_me": {
         "description": "Obtener usuario autenticado (WP).",
         "schema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -457,12 +453,16 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 # ---------------------
-# Endpoints "de cortesía" para probes
+# Endpoints de cortesía (evitan 404 de probes)
 # ---------------------
 @app.get("/")
 @app.post("/")
 def root():
     return {"ok": True, "service": "wp-mcp", "endpoints": ["/mcp", "/mcp/call", "/healthz"]}
+
+@app.get("/favicon.ico", status_code=204)
+def favicon():
+    return PlainTextResponse("")
 
 # ---------------------
 # Salud con y sin slash
@@ -519,6 +519,7 @@ async def mcp_sse(request: Request, authorization: str | None = Header(default=N
             ]
         }
         q.put(("tools", json.dumps(initial)))
+        # keep-alive
         while True:
             time.sleep(15)
             q.put(("ping", json.dumps({"ts": time.time()})))
@@ -548,7 +549,10 @@ async def mcp_sse(request: Request, authorization: str | None = Header(default=N
 @app.post("/mcp/call/")
 async def mcp_call(req: Request, authorization: str | None = Header(default=None)):
     assert_auth(authorization)
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body inválido (JSON)")
     name   = body.get("name")
     params = body.get("arguments") or {}
     if not name:
@@ -563,3 +567,6 @@ async def mcp_call(req: Request, authorization: str | None = Header(default=None
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Tool '{name}' error: {e}")
+
+
+# (fin de server.py)
