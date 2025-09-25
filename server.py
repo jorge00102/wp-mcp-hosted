@@ -1,25 +1,17 @@
 import os, json, time, threading, queue, re, io
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import requests
 
 # =====================
 # Configuración por ENV
 # =====================
-# URL base de WordPress (sin trailing slash)
 WP_BASE_URL = (os.environ.get("WP_BASE_URL", "").strip()).rstrip("/")
 WP_USER     = (os.environ.get("WP_USER", "").strip())
 WP_APP_PASS = (os.environ.get("WP_APP_PASSWORD", "").strip())
-# Token del MCP (para Authorization: Bearer ...)
-MCP_TOKEN   = (os.environ.get("MCP_TOKEN", "").strip())
-
-# Validación mínima de ENV de WP en tiempo de ejecución de herramientas
-
-def _ensure_wp_env():
-    if not WP_BASE_URL or not WP_USER or not WP_APP_PASS:
-        raise HTTPException(status_code=500, detail="WordPress env vars missing: WP_BASE_URL, WP_USER, WP_APP_PASSWORD")
+MCP_TOKEN   = (os.environ.get("MCP_TOKEN", "").strip())  # si vacío -> sin auth
 
 # =====================
 # App FastAPI
@@ -29,19 +21,14 @@ app = FastAPI(title="WP Hosted MCP (HTTP/SSE)", redirect_slashes=False)
 # ---------------------
 # Utilidades de Seguridad
 # ---------------------
-
 def _norm_auth_header(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    # Quita espacios y saltos de línea accidentales
-    v = re.sub(r"\s+", " ", value).strip()
-    return v
-
+    return re.sub(r"\s+", " ", value).strip()
 
 def assert_auth(auth: Optional[str]):
-    # Permite pruebas sin MCP_TOKEN solo si está vacío (no recomendado en prod)
     if not MCP_TOKEN:
-        return
+        return  # sin autenticación si no hay token configurado
     if not auth:
         raise HTTPException(status_code=401, detail="Unauthorized: missing Authorization header")
     auth = _norm_auth_header(auth)
@@ -54,33 +41,83 @@ def assert_auth(auth: Optional[str]):
 # ---------------------
 # Cliente REST de WordPress
 # ---------------------
+def _ensure_wp_env():
+    if not WP_BASE_URL or not WP_USER or not WP_APP_PASS:
+        raise HTTPException(status_code=500, detail="WordPress env vars missing: WP_BASE_URL, WP_USER, WP_APP_PASSWORD")
 
-def wp_request(method: str, path: str, json_body: Dict[str, Any] | None = None, files=None, params: Dict[str, Any] | None = None):
+def wp_request(method: str, path: str, json_body: Dict[str, Any] | None = None,
+               files=None, params: Dict[str, Any] | None = None):
     _ensure_wp_env()
     url = f"{WP_BASE_URL}/wp-json/wp/v2{path}"
     resp = requests.request(
-        method,
-        url,
-        auth=(WP_USER, WP_APP_PASS),
-        json=json_body,
-        files=files,
-        params=params,
-        timeout=45
+        method, url, auth=(WP_USER, WP_APP_PASS),
+        json=json_body, files=files, params=params, timeout=45
     )
-    # Para depuración de errores de plugins de seguridad
     if not resp.ok:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    ct = resp.headers.get("Content-Type", "")
+    ct = (resp.headers.get("Content-Type") or "")
     if ct.startswith("application/json"):
         return resp.json()
     return resp.text
 
 # ---------------------
-# Implementaciones de TOOLS (WordPress)
+# Implementaciones de TOOLS
 # ---------------------
+# 0) Tools genéricas requeridas por varios clientes (search/fetch)
+def tool_search(params: Dict[str, Any]):
+    """
+    Busca en WordPress (páginas y posts) usando /wp/v2/search.
+    """
+    _ensure_wp_env()
+    query = (params.get("query") or "").strip()
+    top_k = int(params.get("top_k", 5))
+    if not query:
+        raise HTTPException(status_code=400, detail="Falta 'query'")
+    # WP search: https://developer.wordpress.org/rest-api/reference/search/
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/search"
+    r = requests.get(url, params={"search": query, "per_page": max(1, min(top_k, 20))}, timeout=30,
+                     auth=(WP_USER, WP_APP_PASS))
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    items = r.json()
+    # Normalizamos campos comunes
+    results = []
+    for it in items:
+        results.append({
+            "id": it.get("id"),
+            "title": (it.get("title") or ""),
+            "url": it.get("url"),
+            "type": it.get("type"),  # post, page, etc.
+            "subtype": it.get("subtype"),
+        })
+    return {"results": results}
 
-# Páginas
+def tool_fetch(params: Dict[str, Any]):
+    """
+    Descarga una URL (GET). Uso general que varios clientes esperan.
+    Limita a http/https y tamaño ~1MB.
+    """
+    url = (params.get("url") or "").strip()
+    if not url or not re.match(r"^https?://", url, re.I):
+        raise HTTPException(status_code=400, detail="URL inválida (se requiere http/https)")
+    r = requests.get(url, timeout=45)
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=f"Fetch falló: {r.status_code}")
+    content_type = r.headers.get("Content-Type", "")
+    content = r.content if len(r.content) <= 1_000_000 else r.content[:1_000_000]
+    # Devolvemos texto si posible
+    try:
+        text = r.text if "text/" in content_type or "json" in content_type else None
+    except Exception:
+        text = None
+    return {
+        "status": r.status_code,
+        "content_type": content_type,
+        "text": text,
+        "bytes_len": len(content),
+    }
 
+# 1) Páginas
 def tool_wp_create_page(params: Dict[str, Any]):
     title   = params.get("title") or "Nueva página"
     content = params.get("content") or ""
@@ -88,7 +125,6 @@ def tool_wp_create_page(params: Dict[str, Any]):
     payload = {"title": title, "content": content, "status": status}
     data = wp_request("POST", "/pages", payload)
     return {"id": data.get("id"), "link": data.get("link"), "status": data.get("status")}
-
 
 def tool_wp_update_page(params: Dict[str, Any]):
     page_id = params.get("id")
@@ -101,23 +137,18 @@ def tool_wp_update_page(params: Dict[str, Any]):
     data = wp_request("POST", f"/pages/{page_id}", updates)
     return {"id": data.get("id"), "link": data.get("link"), "status": data.get("status")}
 
-
 def tool_wp_delete_page(params: Dict[str, Any]):
     page_id = params.get("id")
     force   = bool(params.get("force", False))
     if not page_id:
         raise HTTPException(status_code=400, detail="Falta 'id'")
-    data = wp_request("DELETE", f"/pages/{page_id}", params={"force": str(force).lower()})
-    return data
-
+    return wp_request("DELETE", f"/pages/{page_id}", params={"force": str(force).lower()})
 
 def tool_wp_get_page(params: Dict[str, Any]):
     page_id = params.get("id")
     if not page_id:
         raise HTTPException(status_code=400, detail="Falta 'id'")
-    data = wp_request("GET", f"/pages/{page_id}")
-    return data
-
+    return wp_request("GET", f"/pages/{page_id}")
 
 def tool_wp_list_pages(params: Dict[str, Any]):
     page = int(params.get("page", 1))
@@ -126,25 +157,20 @@ def tool_wp_list_pages(params: Dict[str, Any]):
     p = {"page": page, "per_page": per_page}
     if search:
         p["search"] = search
-    data = wp_request("GET", "/pages", params=p)
-    return data
+    return wp_request("GET", "/pages", params=p)
 
-# Posts
-
+# 2) Posts
 def tool_wp_create_post(params: Dict[str, Any]):
     title   = params.get("title") or "Nuevo post"
     content = params.get("content") or ""
     status  = params.get("status", "draft")
-    categories = params.get("categories")
-    tags = params.get("tags")
     payload = {"title": title, "content": content, "status": status}
-    if categories:
-        payload["categories"] = categories
-    if tags:
-        payload["tags"] = tags
+    if params.get("categories"):
+        payload["categories"] = params["categories"]
+    if params.get("tags"):
+        payload["tags"] = params["tags"]
     data = wp_request("POST", "/posts", payload)
     return {"id": data.get("id"), "link": data.get("link"), "status": data.get("status")}
-
 
 def tool_wp_update_post(params: Dict[str, Any]):
     post_id = params.get("id")
@@ -157,23 +183,18 @@ def tool_wp_update_post(params: Dict[str, Any]):
     data = wp_request("POST", f"/posts/{post_id}", updates)
     return {"id": data.get("id"), "link": data.get("link"), "status": data.get("status")}
 
-
 def tool_wp_delete_post(params: Dict[str, Any]):
     post_id = params.get("id")
     force   = bool(params.get("force", False))
     if not post_id:
         raise HTTPException(status_code=400, detail="Falta 'id'")
-    data = wp_request("DELETE", f"/posts/{post_id}", params={"force": str(force).lower()})
-    return data
-
+    return wp_request("DELETE", f"/posts/{post_id}", params={"force": str(force).lower()})
 
 def tool_wp_get_post(params: Dict[str, Any]):
     post_id = params.get("id")
     if not post_id:
         raise HTTPException(status_code=400, detail="Falta 'id'")
-    data = wp_request("GET", f"/posts/{post_id}")
-    return data
-
+    return wp_request("GET", f"/posts/{post_id}")
 
 def tool_wp_list_posts(params: Dict[str, Any]):
     page = int(params.get("page", 1))
@@ -188,34 +209,24 @@ def tool_wp_list_posts(params: Dict[str, Any]):
         p["categories"] = categories
     if tags:
         p["tags"] = tags
-    data = wp_request("GET", "/posts", params=p)
-    return data
+    return wp_request("GET", "/posts", params=p)
 
-# Media
-
+# 3) Media
 def _download_bytes(url: str) -> bytes:
     r = requests.get(url, timeout=45)
     if not r.ok:
         raise HTTPException(status_code=400, detail=f"No se pudo descargar: {r.status_code}")
     return r.content
 
-
 def tool_wp_upload_media(params: Dict[str, Any]):
-    """Sube un archivo a la librería de medios.
-    Soporta dos modos: (1) pasar bytes como base64 (no recomendado aquí) o (2) URL remota.
-    Aquí implementamos por URL remota para simplicidad.
-    """
     source_url = params.get("source_url")
     filename   = params.get("filename", "upload.bin")
     if not source_url:
         raise HTTPException(status_code=400, detail="Falta 'source_url'")
     content = _download_bytes(source_url)
-    files = {
-        'file': (filename, io.BytesIO(content), 'application/octet-stream')
-    }
+    files = {'file': (filename, io.BytesIO(content), 'application/octet-stream')}
     data = wp_request("POST", "/media", files=files)
     return {"id": data.get("id"), "source_url": data.get("source_url")}
-
 
 def tool_wp_set_featured_image(params: Dict[str, Any]):
     post_id = params.get("post_id")
@@ -225,8 +236,7 @@ def tool_wp_set_featured_image(params: Dict[str, Any]):
     data = wp_request("POST", f"/posts/{post_id}", {"featured_media": media_id})
     return {"id": data.get("id"), "featured_media": data.get("featured_media")}
 
-# Taxonomías
-
+# 4) Taxonomías
 def tool_wp_create_category(params: Dict[str, Any]):
     name = params.get("name")
     slug = params.get("slug")
@@ -236,18 +246,14 @@ def tool_wp_create_category(params: Dict[str, Any]):
     payload = {"name": name}
     if slug: payload["slug"] = slug
     if parent: payload["parent"] = parent
-    data = wp_request("POST", "/categories", payload)
-    return data
-
+    return wp_request("POST", "/categories", payload)
 
 def tool_wp_list_categories(params: Dict[str, Any]):
     search = params.get("search")
     p = {}
     if search:
         p["search"] = search
-    data = wp_request("GET", "/categories", params=p)
-    return data
-
+    return wp_request("GET", "/categories", params=p)
 
 def tool_wp_create_tag(params: Dict[str, Any]):
     name = params.get("name")
@@ -256,282 +262,236 @@ def tool_wp_create_tag(params: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Falta 'name'")
     payload = {"name": name}
     if slug: payload["slug"] = slug
-    data = wp_request("POST", "/tags", payload)
-    return data
-
+    return wp_request("POST", "/tags", payload)
 
 def tool_wp_list_tags(params: Dict[str, Any]):
     search = params.get("search")
     p = {}
     if search:
         p["search"] = search
-    data = wp_request("GET", "/tags", params=p)
-    return data
+    return wp_request("GET", "/tags", params=p)
 
-# Usuario actual (verifica credenciales)
-
+# 5) Usuario actual
 def tool_wp_me(params: Dict[str, Any]):
     _ensure_wp_env()
-    # /users/me está en /wp-json/wp/v2/users/me
     data = wp_request("GET", "/users/me")
     return {"id": data.get("id"), "name": data.get("name"), "url": data.get("url"), "roles": data.get("roles")}
 
 # ---------------------
-# Catálogo de TOOLS (con JSON Schemas estrictos)
+# Catálogo de TOOLS
 # ---------------------
-
 TOOLS: Dict[str, Dict[str, Any]] = {
-    # Páginas
+    # Genéricas
+    "search": {
+        "description": "Buscar contenido por texto. Devuelve resultados con título y URL.",
+        "schema": {"type": "object",
+                   "properties": {"query": {"type": "string"},
+                                  "top_k": {"type": "integer", "minimum": 1, "maximum": 20}},
+                   "required": ["query"], "additionalProperties": False},
+        "handler": tool_search
+    },
+    "fetch": {
+        "description": "Descargar una URL (GET). Devuelve tipo de contenido y texto si aplica.",
+        "schema": {"type": "object",
+                   "properties": {"url": {"type": "string"}},
+                   "required": ["url"], "additionalProperties": False},
+        "handler": tool_fetch
+    },
+
+    # WordPress - páginas
     "wp_create_page": {
         "description": "Crear página en WordPress.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "title":{"type":"string"},
-                "content":{"type":"string"},
-                "status":{"type":"string", "enum":["publish","draft","private"]}
-            },
-            "required":["title","content"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"title": {"type": "string"},
+                                  "content": {"type": "string"},
+                                  "status": {"type": "string", "enum": ["publish", "draft", "private"]}},
+                   "required": ["title", "content"], "additionalProperties": False},
         "handler": tool_wp_create_page
     },
     "wp_update_page": {
         "description": "Actualizar página por ID.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "title":{"type":"string"},
-                "content":{"type":"string"},
-                "status":{"type":"string","enum":["publish","draft","private"]},
-                "slug":{"type":"string"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"},
+                                  "title": {"type": "string"},
+                                  "content": {"type": "string"},
+                                  "status": {"type": "string", "enum": ["publish", "draft", "private"]},
+                                  "slug": {"type": "string"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_update_page
     },
     "wp_delete_page": {
-        "description": "Eliminar página por ID (usa force=true para borrar permanentemente).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "force":{"type":"boolean"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "description": "Eliminar página por ID (force=true para borrar permanentemente).",
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"},
+                                  "force": {"type": "boolean"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_delete_page
     },
     "wp_get_page": {
         "description": "Obtener página por ID.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_get_page
     },
     "wp_list_pages": {
-        "description": "Listar páginas (paginado y búsqueda).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "page":{"type":"integer"},
-                "per_page":{"type":"integer"},
-                "search":{"type":"string"}
-            },
-            "additionalProperties": False
-        },
+        "description": "Listar páginas con paginado/búsqueda.",
+        "schema": {"type": "object",
+                   "properties": {"page": {"type": "integer"},
+                                  "per_page": {"type": "integer"},
+                                  "search": {"type": "string"}},
+                   "additionalProperties": False},
         "handler": tool_wp_list_pages
     },
 
-    # Posts
+    # WordPress - posts
     "wp_create_post": {
-        "description": "Crear entrada (post) en WordPress.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "title":{"type":"string"},
-                "content":{"type":"string"},
-                "status":{"type":"string","enum":["publish","draft","private"]},
-                "categories":{"type":"array","items":{"type":"integer"}},
-                "tags":{"type":"array","items":{"type":"integer"}}
-            },
-            "required":["title","content"],
-            "additionalProperties": False
-        },
+        "description": "Crear post.",
+        "schema": {"type": "object",
+                   "properties": {"title": {"type": "string"},
+                                  "content": {"type": "string"},
+                                  "status": {"type": "string", "enum": ["publish", "draft", "private"]},
+                                  "categories": {"type": "array", "items": {"type": "integer"}},
+                                  "tags": {"type": "array", "items": {"type": "integer"}}},
+                   "required": ["title", "content"], "additionalProperties": False},
         "handler": tool_wp_create_post
     },
     "wp_update_post": {
         "description": "Actualizar post por ID.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "title":{"type":"string"},
-                "content":{"type":"string"},
-                "status":{"type":"string","enum":["publish","draft","private"]},
-                "slug":{"type":"string"},
-                "categories":{"type":"array","items":{"type":"integer"}},
-                "tags":{"type":"array","items":{"type":"integer"}},
-                "featured_media":{"type":"integer"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"},
+                                  "title": {"type": "string"},
+                                  "content": {"type": "string"},
+                                  "status": {"type": "string", "enum": ["publish", "draft", "private"]},
+                                  "slug": {"type": "string"},
+                                  "categories": {"type": "array", "items": {"type": "integer"}},
+                                  "tags": {"type": "array", "items": {"type": "integer"}},
+                                  "featured_media": {"type": "integer"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_update_post
     },
     "wp_delete_post": {
-        "description": "Eliminar post por ID (usa force=true para borrar permanentemente).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "force":{"type":"boolean"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "description": "Eliminar post por ID (force=true para borrar permanentemente).",
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"},
+                                  "force": {"type": "boolean"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_delete_post
     },
     "wp_get_post": {
         "description": "Obtener post por ID.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"}
-            },
-            "required":["id"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"id": {"type": "integer"}},
+                   "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_get_post
     },
     "wp_list_posts": {
-        "description": "Listar posts (paginado, búsqueda, categorías y tags).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "page":{"type":"integer"},
-                "per_page":{"type":"integer"},
-                "search":{"type":"string"},
-                "categories":{"type":"array","items":{"type":"integer"}},
-                "tags":{"type":"array","items":{"type":"integer"}}
-            },
-            "additionalProperties": False
-        },
+        "description": "Listar posts (paginado/búsqueda).",
+        "schema": {"type": "object",
+                   "properties": {"page": {"type": "integer"},
+                                  "per_page": {"type": "integer"},
+                                  "search": {"type": "string"},
+                                  "categories": {"type": "array", "items": {"type": "integer"}},
+                                  "tags": {"type": "array", "items": {"type": "integer"}}},
+                   "additionalProperties": False},
         "handler": tool_wp_list_posts
     },
 
-    # Media
+    # WordPress - media
     "wp_upload_media": {
-        "description": "Subir archivo a Medios desde una URL remota (source_url).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "source_url":{"type":"string"},
-                "filename":{"type":"string"}
-            },
-            "required":["source_url"],
-            "additionalProperties": False
-        },
+        "description": "Subir archivo a Medios desde URL remota.",
+        "schema": {"type": "object",
+                   "properties": {"source_url": {"type": "string"},
+                                  "filename": {"type": "string"}},
+                   "required": ["source_url"], "additionalProperties": False},
         "handler": tool_wp_upload_media
     },
     "wp_set_featured_image": {
-        "description": "Asignar imagen destacada a un post (featured_media).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "post_id":{"type":"integer"},
-                "media_id":{"type":"integer"}
-            },
-            "required":["post_id","media_id"],
-            "additionalProperties": False
-        },
+        "description": "Asignar imagen destacada a un post.",
+        "schema": {"type": "object",
+                   "properties": {"post_id": {"type": "integer"},
+                                  "media_id": {"type": "integer"}},
+                   "required": ["post_id", "media_id"], "additionalProperties": False},
         "handler": tool_wp_set_featured_image
     },
 
-    # Taxonomías
+    # WordPress - taxonomías
     "wp_create_category": {
         "description": "Crear categoría.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "name":{"type":"string"},
-                "slug":{"type":"string"},
-                "parent":{"type":"integer"}
-            },
-            "required":["name"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"name": {"type": "string"},
+                                  "slug": {"type": "string"},
+                                  "parent": {"type": "integer"}},
+                   "required": ["name"], "additionalProperties": False},
         "handler": tool_wp_create_category
     },
     "wp_list_categories": {
-        "description": "Listar categorías (opcional búsqueda).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "search":{"type":"string"}
-            },
-            "additionalProperties": False
-        },
+        "description": "Listar categorías.",
+        "schema": {"type": "object",
+                   "properties": {"search": {"type": "string"}},
+                   "additionalProperties": False},
         "handler": tool_wp_list_categories
     },
     "wp_create_tag": {
         "description": "Crear tag.",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "name":{"type":"string"},
-                "slug":{"type":"string"}
-            },
-            "required":["name"],
-            "additionalProperties": False
-        },
+        "schema": {"type": "object",
+                   "properties": {"name": {"type": "string"},
+                                  "slug": {"type": "string"}},
+                   "required": ["name"], "additionalProperties": False},
         "handler": tool_wp_create_tag
     },
     "wp_list_tags": {
-        "description": "Listar tags (opcional búsqueda).",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "search":{"type":"string"}
-            },
-            "additionalProperties": False
-        },
+        "description": "Listar tags.",
+        "schema": {"type": "object",
+                   "properties": {"search": {"type": "string"}},
+                   "additionalProperties": False},
         "handler": tool_wp_list_tags
     },
 
-    # Me (usuario)
+    # Usuario
     "wp_me": {
-        "description": "Obtener el usuario autenticado (verifica credenciales).",
-        "schema": {
-            "type":"object",
-            "properties":{},
-            "additionalProperties": False
-        },
+        "description": "Obtener usuario autenticado (WP).",
+        "schema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_wp_me
-    }
+    },
 }
 
 # ---------------------
-# Endpoints de Salud (con y sin slash)
+# Endpoints "de cortesía" para probes
+# ---------------------
+@app.get("/")
+@app.post("/")
+def root():
+    return {"ok": True, "service": "wp-mcp", "endpoints": ["/mcp", "/mcp/call", "/healthz"]}
+
+# ---------------------
+# Salud con y sin slash
 # ---------------------
 @app.get("/healthz", response_class=PlainTextResponse)
 @app.get("/healthz/", response_class=PlainTextResponse)
 def healthz():
     return "ok"
+
+# ---------------------
+# Schema (debug opcional)
+# ---------------------
+@app.get("/mcp/schema")
+@app.get("/mcp/schema/")
+def mcp_schema(authorization: str | None = Header(default=None)):
+    assert_auth(authorization)
+    return {
+        "type": "mcp",
+        "transport": "sse",
+        "tools": {name: {"description": t["description"], "schema": t["schema"]} for name, t in TOOLS.items()}
+    }
+
+# ---------------------
+# POST /mcp (sondeo de compatibilidad)
+# ---------------------
 @app.post("/mcp")
 @app.post("/mcp/")
 def mcp_probe(authorization: str | None = Header(default=None)):
-    # si tienes MCP_TOKEN vacío, este assert no bloquea
     assert_auth(authorization)
-    # respuesta de “sondeo” con el catálogo de tools
     return {
         "type": "mcp",
         "transport": "sse",
@@ -542,41 +502,23 @@ def mcp_probe(authorization: str | None = Header(default=None)):
     }
 
 # ---------------------
-# Endpoint de Schema (debug opcional)
-# ---------------------
-@app.get("/mcp/schema")
-@app.get("/mcp/schema/")
-def mcp_schema(authorization: str | None = Header(default=None)):
-    assert_auth(authorization)
-    return {
-        "type": "mcp",
-        "transport": "sse",
-        "tools": {
-            name: {"description": t["description"], "schema": t["schema"]}
-            for name, t in TOOLS.items()
-        }
-    }
-
-# ---------------------
-# SSE: /mcp (con y sin slash)
+# GET /mcp – SSE (primer evento: tools)
 # ---------------------
 @app.get("/mcp")
 @app.get("/mcp/")
 async def mcp_sse(request: Request, authorization: str | None = Header(default=None)):
     assert_auth(authorization)
 
-    q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+    q: "queue.Queue[Tuple[str, str]]" = queue.Queue()
 
     def producer():
-        # Evento inicial: TOOLS (es lo primero que espera el conector)
-        tools_payload = {
+        initial = {
             "tools": [
                 {"name": name, "description": t["description"], "schema": t["schema"]}
                 for name, t in TOOLS.items()
             ]
         }
-        q.put(("tools", json.dumps(tools_payload)))
-        # Keep-alive
+        q.put(("tools", json.dumps(initial)))
         while True:
             time.sleep(15)
             q.put(("ping", json.dumps({"ts": time.time()})))
@@ -596,14 +538,11 @@ async def mcp_sse(request: Request, authorization: str | None = Header(default=N
     return EventSourceResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"}
     )
 
 # ---------------------
-# Invocación de Tools (con y sin slash)
+# Invocar tools
 # ---------------------
 @app.post("/mcp/call")
 @app.post("/mcp/call/")
@@ -614,13 +553,13 @@ async def mcp_call(req: Request, authorization: str | None = Header(default=None
     params = body.get("arguments") or {}
     if not name:
         raise HTTPException(status_code=400, detail="Falta 'name'")
-    if name not in TOOLS:
+    tool = TOOLS.get(name)
+    if not tool:
         raise HTTPException(status_code=404, detail=f"Tool '{name}' no existe")
     try:
-        result = TOOLS[name]["handler"](params)
+        result = tool["handler"](params)
         return {"ok": True, "result": result}
     except HTTPException:
         raise
     except Exception as e:
-        # Error genérico controlado para el agente
         raise HTTPException(status_code=500, detail=f"Tool '{name}' error: {e}")
