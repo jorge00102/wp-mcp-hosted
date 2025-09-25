@@ -2,6 +2,7 @@ import os, json, time, threading, queue, re, io
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 import requests
 
@@ -17,6 +18,15 @@ MCP_TOKEN   = (os.environ.get("MCP_TOKEN", "").strip())  # si vacío -> sin auth
 # App FastAPI
 # =====================
 app = FastAPI(title="WP Hosted MCP (HTTP/SSE)", redirect_slashes=False)
+
+# --- CORS (necesario para crear el conector desde la web de ChatGPT) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # si quieres restringir: ["https://chat.openai.com","https://chatgpt.com"]
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],           # incluye Authorization, Content-Type, etc.
+)
 
 # ---------------------
 # Utilidades de Seguridad
@@ -297,7 +307,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                    "properties": {"title": {"type": "string"},
                                   "content": {"type": "string"},
                                   "status": {"type": "string", "enum": ["publish", "draft", "private"]}},
-                   "required": ["title", "content"], "additionalProperties": False},
+        "required": ["title", "content"], "additionalProperties": False},
         "handler": tool_wp_create_page
     },
     "wp_update_page": {
@@ -308,7 +318,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                   "content": {"type": "string"},
                                   "status": {"type": "string", "enum": ["publish", "draft", "private"]},
                                   "slug": {"type": "string"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_update_page
     },
     "wp_delete_page": {
@@ -316,14 +326,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object",
                    "properties": {"id": {"type": "integer"},
                                   "force": {"type": "boolean"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_delete_page
     },
     "wp_get_page": {
         "description": "Obtener página por ID.",
         "schema": {"type": "object",
                    "properties": {"id": {"type": "integer"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_get_page
     },
     "wp_list_pages": {
@@ -332,7 +342,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                    "properties": {"page": {"type": "integer"},
                                   "per_page": {"type": "integer"},
                                   "search": {"type": "string"}},
-                   "additionalProperties": False},
+        "additionalProperties": False},
         "handler": tool_wp_list_pages
     },
 
@@ -345,7 +355,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                   "status": {"type": "string", "enum": ["publish", "draft", "private"]},
                                   "categories": {"type": "array", "items": {"type": "integer"}},
                                   "tags": {"type": "array", "items": {"type": "integer"}}},
-                   "required": ["title", "content"], "additionalProperties": False},
+        "required": ["title", "content"], "additionalProperties": False},
         "handler": tool_wp_create_post
     },
     "wp_update_post": {
@@ -359,7 +369,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                   "categories": {"type": "array", "items": {"type": "integer"}},
                                   "tags": {"type": "array", "items": {"type": "integer"}},
                                   "featured_media": {"type": "integer"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_update_post
     },
     "wp_delete_post": {
@@ -367,14 +377,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object",
                    "properties": {"id": {"type": "integer"},
                                   "force": {"type": "boolean"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_delete_post
     },
     "wp_get_post": {
         "description": "Obtener post por ID.",
         "schema": {"type": "object",
                    "properties": {"id": {"type": "integer"}},
-                   "required": ["id"], "additionalProperties": False},
+        "required": ["id"], "additionalProperties": False},
         "handler": tool_wp_get_post
     },
     "wp_list_posts": {
@@ -385,7 +395,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                   "search": {"type": "string"},
                                   "categories": {"type": "array", "items": {"type": "integer"}},
                                   "tags": {"type": "array", "items": {"type": "integer"}}},
-                   "additionalProperties": False},
+        "additionalProperties": False},
         "handler": tool_wp_list_posts
     },
 
@@ -395,7 +405,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object",
                    "properties": {"source_url": {"type": "string"},
                                   "filename": {"type": "string"}},
-                   "required": ["source_url"], "additionalProperties": False},
+        "required": ["source_url"], "additionalProperties": False},
         "handler": tool_wp_upload_media
     },
     "wp_set_featured_image": {
@@ -403,7 +413,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object",
                    "properties": {"post_id": {"type": "integer"},
                                   "media_id": {"type": "integer"}},
-                   "required": ["post_id", "media_id"], "additionalProperties": False},
+        "required": ["post_id", "media_id"], "additionalProperties": False},
         "handler": tool_wp_set_featured_image
     },
 
@@ -414,14 +424,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                    "properties": {"name": {"type": "string"},
                                   "slug": {"type": "string"},
                                   "parent": {"type": "integer"}},
-                   "required": ["name"], "additionalProperties": False},
+        "required": ["name"], "additionalProperties": False},
         "handler": tool_wp_create_category
     },
     "wp_list_categories": {
         "description": "Listar categorías.",
         "schema": {"type": "object",
                    "properties": {"search": {"type": "string"}},
-                   "additionalProperties": False},
+        "additionalProperties": False},
         "handler": tool_wp_list_categories
     },
     "wp_create_tag": {
@@ -429,14 +439,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object",
                    "properties": {"name": {"type": "string"},
                                   "slug": {"type": "string"}},
-                   "required": ["name"], "additionalProperties": False},
+        "required": ["name"], "additionalProperties": False},
         "handler": tool_wp_create_tag
     },
     "wp_list_tags": {
         "description": "Listar tags.",
         "schema": {"type": "object",
                    "properties": {"search": {"type": "string"}},
-                   "additionalProperties": False},
+        "additionalProperties": False},
         "handler": tool_wp_list_tags
     },
 
@@ -545,6 +555,7 @@ async def mcp_sse(request: Request, authorization: str | None = Header(default=N
                 break
             try:
                 ev, data = q.get(timeout=30)
+                # El middleware CORS añade los encabezados CORS automáticamente
                 yield {"event": ev, "data": data}
             except queue.Empty:
                 yield {"event": "ping", "data": json.dumps({"ts": time.time()})}
@@ -552,7 +563,11 @@ async def mcp_sse(request: Request, authorization: str | None = Header(default=N
     return EventSourceResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"}
+        headers={
+            # útiles para proxies/CDN
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 # ---------------------
